@@ -1,0 +1,825 @@
+---
+title: "analysis for iLAM paper"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r, quiet=TRUE}
+library(behavr)
+library(damr)
+library(scopr)
+library(sleepr)
+library(ggetho)
+library(zeitgebr)
+library(tidyr)
+library(zoo)
+library(ggpubr)
+library(ggplot2)
+library(signal)
+library(pracma)
+library(scales)
+library(reshape2)
+library(svglite)
+library(readr)
+
+if(any(grepl("package:plyr", search()))) detach("package:plyr") else message("plyr not loaded")
+library('dplyr')
+
+setwd(dirname(rstudioapi::getSourceEditorContext()$path))
+
+#read in iLAM functions
+for (f in list.files("../scripts", pattern="*.R",
+                     full.names = TRUE)) {
+  source(f)
+}
+
+```
+
+Read in the iLAM output for Photinus cages. Plot activity.
+```{r}
+metadata_p = read_delim("metadata_photinus_v4.csv", 
+    delim = ";", escape_double = FALSE, trim_ws = TRUE)
+
+#link entire metadata with the iLAM files
+metadata_entire = metadata_p %>% link_dam_metadata(result_dir = getwd()) 
+
+iLAM_photinus <- load_dam(metadata_entire) 
+summary(iLAM_photinus)
+
+#Note that the time variable is in seconds, so t/60 converts to minutes
+head(iLAM_photinus$t/60)
+
+#add uid for specific identification for each cage/experiment/species
+iLAM_photinus[, uid := 1:.N, meta=T]
+
+#For each timepoint, collapse rows/observations into 30 minute bins
+#The sum of every 15 rows 15 = seq(0,14) = 30min bins
+iLAM_photinus[, activity_bin := rollapply(activity, list(seq(0, 14)),
+                                          FUN=function(x) sum(x, na.rm=TRUE),
+                                          partial = TRUE, fill = NA),
+              by = xmv(uid)]
+
+#For each uid, retains only the 15th row (t) = 30min bins
+iLAM_photinus = iLAM_photinus[, .SD[seq(1, .N, 15)], by = id]
+
+#Calculate average activity across all bins to normalize activity_bins between cages
+iLAM_photinus[, uid := 1:.N, meta=T]
+iLAM_photinus[, fctr := .(1/mean(activity_bin)), by = xmv(uid)]
+iLAM_photinus[, .N, by=xmv(uid)] #verify that proper number of bins were kept
+
+#Multiple activity_bin by normalization factor
+iLAM_photinus[, acn := activity_bin*fctr]
+
+#check, how many missing values are there?
+table(is.na(iLAM_photinus$activity_bin))
+
+#remove first day of acclimation
+iLAM_photinus = iLAM_photinus[t>=days(1)]
+iLAM_photinus$t = iLAM_photinus$t-days(1)
+
+#visualize average across individuals within a species for first 72 hours
+p_photinus_activity = ggetho(iLAM_photinus,
+                             aes(y=acn, colour=species),
+                             time_wrap = hours(24.1)) +
+  stat_pop_etho(size=0.75) +
+  stat_ld_annotations(l_duration = as.numeric(hours(16)),
+                      ld_colours = c("#FDFD66","black"))  +
+  theme_bw() + theme(text = element_text(size = 12, family = "sans", color = 'black'),
+                     panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(),
+                     legend.position = c(0.14,0.70),
+                     legend.text = element_text(face = "italic", size=10),
+                     legend.title = element_blank()) +
+  ylab("Activity") + xlab("Time (ZT)") +
+  scale_color_manual(values=c("#00EE76", "#AB82FF", "darkgray"), 
+                     labels = c(paste("P. greeni", "\u2642"),
+                                paste("P. marginellus", "\u2642"),
+                                paste("P. obscurellus", "\u2642"))) +
+  scale_fill_manual(values=c("#00EE76", "#AB82FF", "gray"),
+                    labels = c(paste("P. greeni", "\u2642"),
+                               paste("P. marginellus", "\u2642"),
+                               paste("P. obscurellus", "\u2642"))) + ylim(c(0,50))
+p_photinus_activity
+#ggsave("activity_ld_photinus.png",p_photinus_activity, height=4, width = 8, units=c("in"))
+
+
+```
+
+Calculate peak activity phase and nocturnality of Photinus. Plot results.
+```{r}
+#generate a dataframe to record information about peak activity phase and
+#ratio of nocturnal/diurnal activity
+diel_act_photinus = data.frame(expand.grid(uid = iLAM_photinus[meta=T]$uid,
+                        day = seq(0,2,1)),
+                        species = iLAM_photinus[meta=T]$species,
+                        phase = 0,
+                        activity_day = 0,
+                        activity_night = 0,
+                        before_4hr = 0,
+                        before_8hr = 0,
+                        before_2hr_am = 0,
+                        before_4hr_am = 0) %>% arrange(uid, day)
+
+#Set up butterworth filter, which we'll apply to each subset of binned data
+#order 2, 10 Hz low-pass filter t <- seq(0, 1, len = 96) # 1 second sample of time values
+bf <- butter(n = 2, W = 0.1, type = "low", plane = "z")
+
+#return parameters for each individual cage (uid)
+for (i in 1:nrow(diel_act_photinus)){
+  
+  sub_iLAM_photinus = iLAM_photinus[xmv(uid) == diel_act_photinus$uid[i]]
+  
+  #calculate phase of peak evening activity and day/night activity for each day of recording
+  
+  #now, isolate a specific day and calculate phase, total day activity, total night activity
+  small_dt_photinus <- sub_iLAM_photinus[t>=hours(diel_act_photinus$day[i]*24)&
+                                           t<=hours(diel_act_photinus$day[i]*24+24)]
+  small_dt_photinus$t <- small_dt_photinus$t/60/60-diel_act_photinus$day[i]*24
+  
+  #for each uid, apply butterworth filter
+  small_dt_photinus[, activity_butter := round(filtfilt(bf, activity_bin), 0)]
+  #return phase for each uid
+  small_df_photinus <- as.data.frame(rejoin(small_dt_photinus))
+  
+  # Returns a matrix where each row represents one peak found.
+  # The first column gives the height,
+  # second the position/index where the maximum is reached, 
+  # third and forth the indices of where the peak begins and ends,
+  # in the sense of where the pattern starts and ends.
+  
+  diel_act_photinus$phase[i] = small_df_photinus$t[findpeaks(small_df_photinus$activity_butter,
+                                                       sortstr = TRUE,
+                                                       npeaks = 4,
+                                                       nups = 2)[1,2]]
+  
+  #calculate ratio night/day activity for each day
+  day <- sub_iLAM_photinus[t>=hours(diel_act_photinus$day[i]*24) & t<hours(diel_act_photinus$day[i]*24+16)]
+  
+  diel_act_photinus$activity_day[i] = sum(day$activity_bin, na.rm = TRUE)
+  
+  night = sub_iLAM_photinus[t>=hours(diel_act_photinus$day[i]*24+16) & 
+                              t<hours(diel_act_photinus$day[i]*24+24)]
+  
+  diel_act_photinus$activity_night[i] = sum(night$activity_bin, na.rm = TRUE)
+  
+  #calculate the evening anticipation/day (ratio activity 4 hrs from night transition/8 hrs from night transition)
+   before_4hr <- sub_iLAM_photinus[t>=hours(diel_act_photinus$day[i]*24+12) & #12 for evening or morning antic
+                              t<=hours(diel_act_photinus$day[i]*24+16)] #16 for evening or morning antic
+   
+   before_8hr <- sub_iLAM_photinus[t>=hours(diel_act_photinus$day[i]*24+8) & #8 for evening or morning antic
+                              t<=hours(diel_act_photinus$day[i]*24+16)] #16 for evening or morning antic
+   
+  
+  diel_act_photinus$before_4hr[i] = sum(before_4hr$activity_bin, na.rm = TRUE)
+  diel_act_photinus$before_8hr[i] = sum(before_8hr$activity_bin, na.rm = TRUE)
+  
+    #calculate the morning anticipation/day (ratio activity 2 hrs from morning transition/4 hrs from morning transition)
+   before_2hr_am <- sub_iLAM_photinus[t>=hours(diel_act_photinus$day[i]*24+22) & #12 for evening or morning antic
+                              t<=hours(diel_act_photinus$day[i]*24+24)] #16 for evening or morning antic
+   
+   before_4hr_am <- sub_iLAM_photinus[t>=hours(diel_act_photinus$day[i]*24+20) & #8 for evening or morning antic
+                              t<=hours(diel_act_photinus$day[i]*24+24)] #16 for evening or morning antic
+   
+  
+  diel_act_photinus$before_2hr_am[i] = sum(before_2hr_am$activity_bin, na.rm = TRUE)
+  diel_act_photinus$before_4hr_am[i] = sum(before_4hr_am$activity_bin, na.rm = TRUE)
+  
+  
+
+}
+
+diel_act_photinus$perc_noct = round(diel_act_photinus$activity_night/
+                                      (diel_act_photinus$activity_night+diel_act_photinus$activity_day)*100,
+                                    2)
+diel_act_photinus$phase = round(as.numeric(diel_act_photinus$phase),2)
+diel_act_photinus$evening_antic = round((diel_act_photinus$before_4hr/diel_act_photinus$before_8hr),2)
+diel_act_photinus$morning_antic = round((diel_act_photinus$before_2hr_am/diel_act_photinus$before_4hr_am),2)
+
+
+#summarize mean for each uid! #dplyr::filter(diel_act_photinus, day==2)
+mean_diel_act_photinus = diel_act_photinus %>% group_by(species, day) %>%
+  summarise(phase = mean(phase),
+            n = n(),
+            perc_noct = mean(perc_noct),
+            evening_antic = mean(evening_antic, na.rm = TRUE),
+            morning_antic = mean(morning_antic, na.rm = TRUE))
+#summarise mean for each species
+species_diel_act_photinus = mean_diel_act_photinus %>% group_by(species) %>% 
+  summarise(activity_phase = round(mean(phase),2),
+            ymin_phase = tryCatch(round(t.test(phase)$conf.int[1],2),
+                                  error = function(e) return(NA)),
+            ymax_phase = tryCatch(round(t.test(phase)$conf.int[2],2),
+                                  error = function(e) return(NA)),
+            n = n(),
+            index_noct = mean(perc_noct),
+            ymin_noct = round(t.test(perc_noct)$conf.int[1],2),
+            ymax_noct = round(t.test(perc_noct)$conf.int[2],2),
+            index_antic = round(mean(evening_antic),3),
+            ymin_antic = round(t.test(evening_antic)$conf.int[1], 3),
+            ymax_antic = round(t.test(evening_antic)$conf.int[2],3),
+            index_antic_am = round(mean(morning_antic),2),
+            ymin_antic_am = round(t.test(morning_antic)$conf.int[1], 2),
+            ymax_antic_am = round(t.test(morning_antic)$conf.int[2], 2))
+
+species_diel_act_photinus$ymax_noct[species_diel_act_photinus$ymax_noct>=100] = 100
+species_diel_act_photinus$ymax_antic[species_diel_act_photinus$ymax_antic>=1] = 1
+
+p_antic = ggplot(data=mean_diel_act_photinus, aes(x = species, y=evening_antic, color=species)) +
+  geom_point(size=3, alpha=0.5) +
+    geom_errorbar(data = species_diel_act_photinus,
+                  aes(x=species, ymin=ymin_antic, ymax=ymax_antic, color=species),
+                color = "black", inherit.aes = FALSE,
+                size = 0.2, width=0.25) +
+  scale_color_manual(values=c("#00EE76", "#AB82FF", "darkgray")) +
+  theme_bw() + ylim(c(0,1)) +
+  theme(text = element_text(size = 12, family = "sans", color = 'black'),
+        strip.background = element_blank(),
+        strip.text.x = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.text.x = element_text(face = "italic")) +
+  ylab("Anticipation Index") + xlab("Species")
+
+p_nd = ggplot(data=mean_diel_act_photinus, aes(x = species, y=perc_noct, color=species)) +
+  geom_point(size=3, alpha=0.5) +
+  geom_errorbar(data = species_diel_act_photinus,
+                aes(x=species, ymin=ymin_noct, ymax=ymax_noct, color=species),
+                color = "black", inherit.aes = FALSE,
+                size = 0.2, width=0.25) +
+  scale_color_manual(values=c("#00EE76", "#AB82FF", "darkgray")) +
+  theme_bw() + ylim(c(0,100)) +
+  theme(text = element_text(size = 12, family = "sans", color = 'black'),
+        strip.background = element_blank(),
+        strip.text.x = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.text.x = element_text(face = "italic")) +
+  ylab("Nocturnality (%)") + xlab("Species")
+
+p_all = ggarrange(p_photinus_activity,                                               
+          ggarrange(p_antic, p_nd, ncol = 2, labels = c("B", "C")),
+          nrow = 2,
+          labels = "A") 
+p_all
+#ggsave("analysis_photinus.png",p_all, height=8, width = 16, units=c("in"))
+
+```
+
+Read in the iLAM output for Ostrinia cages. Plot activity. 
+```{r}
+metadata_o = read_delim("metadata_onub.csv", 
+    delim = ";", escape_double = FALSE, trim_ws = TRUE)
+
+#link entire metadata with the iLAM files
+metadata_o = metadata_o %>% link_dam_metadata(result_dir = getwd()) 
+
+iLAM_onub <- load_dam(metadata_o) 
+summary(iLAM_onub)
+
+#split data by strain: iLAM_BE vs. iLAM_UZ
+iLAM_BE = iLAM_onub[xmv(strain) == "be"]
+iLAM_UZ = iLAM_onub[xmv(strain) == "uz"]
+
+#initially, work with BE data
+#add uid for specific identification for each cage/experiment/species
+iLAM_BE[, uid := 1:.N, meta=T]
+
+iLAM_BE[, activity_bin := rollapply(activity, list(seq(0, 14)),
+                                          FUN=function(x) sum(x, na.rm=TRUE),
+                                          partial = TRUE, fill = NA),
+              by = xmv(uid)]
+
+#For each uid, retains only the 15th row (t) = 30min bins, 5 = 10min bins
+iLAM_BE = iLAM_BE[, .SD[seq(1, .N, 15)], by = id]
+
+#Calculate average activity across all bins to normalize activity_bins between cages
+iLAM_BE[, uid := 1:.N, meta=T]
+iLAM_BE[, fctr := .(10/mean(activity_bin)), by = xmv(uid)]
+iLAM_BE[, .N, by=xmv(uid)] #verify that proper number of bins were kept
+
+#Multiple activity_bin by normalization factor
+iLAM_BE[, acn := activity_bin*fctr]
+
+
+#visualize average across individuals for first 72 hours
+p_be_activity = ggetho(iLAM_BE, aes(y=acn, colour=sex), time_wrap = hours(24.1)) +
+  stat_pop_etho(size=0.75) +
+  stat_ld_annotations(l_duration = as.numeric(hours(16)),
+                      ld_colours = c("#FDFD66","black")) +
+  stat_ld_annotations(x_limits = days(c(3,7)),
+                      ld_colours = c("grey", "black")) +
+  theme_bw() + theme(text = element_text(size = 12, family = "sans", color = 'black'),
+                     panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(),
+                     legend.position = c(0.12,0.7),
+                     legend.text = element_text(size=10, face = "italic"),
+                     legend.title = element_blank()) +
+  ylab("Activity") + xlab("Time (ZT)") +
+  scale_color_manual(values = c("#E69F00", "#56B4E9"),
+                     labels = c(paste("O. nubilalis", "\u2640"),
+                                paste("O. nubilalis", "\u2642"))) +
+  scale_fill_manual(values = c("#E69F00", "#56B4E9"),
+                    labels = c(paste("O. nubilalis", "\u2640"),
+                                paste("O. nubilalis", "\u2642"))) +
+  ylim(c(0,50))
+
+p_be_activity
+```
+
+Read in the TriKinetics DAM output for Ostrinia tubes. Plot activity. 
+```{r}
+metadata_dam = read_delim("metadata_dam_202305.csv", 
+                      delim = ",", escape_double = FALSE, trim_ws = TRUE)
+
+metadata_dam$sex = as.factor(metadata_dam$sex)
+table(metadata_dam$sex)
+str(metadata_dam)
+
+metadata_dam <- metadata_dam %>%
+  link_dam_metadata(result_dir = getwd())
+
+dam_o <- load_dam(metadata_dam) 
+
+summary(dam_o)
+dam_o[meta=T]
+
+dam_o <- dam_o[(xmv(sex) == "male" | xmv(sex) == "female")]
+summary(dam_o)
+
+dam_o[, uid := 1:.N, meta=T]
+
+dam_o = dam_o[t>=days(1)]
+dam_o$t = dam_o$t-days(1)
+
+
+
+dam_o[, activity_bin := rollapply(activity, list(seq(0, 14)),
+                                          FUN=function(x) sum(x, na.rm=TRUE),
+                                          partial = TRUE, fill = NA),
+              by = xmv(uid)]
+
+#For each uid, retains only the 15th row (t) = 30min bins, 5 = 10min bins
+dam_o = dam_o[, .SD[seq(1, .N, 15)], by = id]
+
+#Calculate average activity across all bins to normalize activity_bins between cages
+dam_o[, uid := 1:.N, meta=T]
+dam_o[, .N, by=xmv(uid)] #verify that proper number of bins were kept
+dam_o[, .(mean_acti = 1/mean(activity_bin)), by=xmv(uid)]
+
+dam_o[ , .(ind_sum = sum(activity_bin)), by = xmv(uid)]$ind_sum %>% median()
+dam_o[, inactive := .(sum(activity_bin)<750), by = xmv(uid)] #remove wonky individuals with abnormally low mvmnt (likely dead)
+
+dam_o <- dam_o[inactive == FALSE]
+summary(dam_o)
+
+p_dam_activity = ggetho(dam_o, aes(y=acn, colour=sex), time_wrap = hours(24.1)) +
+  stat_pop_etho(size=0.70) +
+  stat_ld_annotations(l_duration = as.numeric(hours(16)),
+                      ld_colours = c("#FDFD66","black")) +
+  stat_ld_annotations(x_limits = days(c(3,4)),
+                      ld_colours = c("grey", "black")) +
+  theme_bw() + theme(text = element_text(size = 12, family = "sans", color = 'black'),
+                     panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(),
+                     legend.position = c(0.12,0.70),
+                     legend.text = element_text(size=10, face = "italic"),
+                     legend.title = element_blank()) +
+  ylab("Activity") + xlab("Time (AZT)") +
+  scale_color_manual(values = c("#E69F00", "#56B4E9"),
+                     labels = c(paste("O. nubilalis", "\u2640"),
+                                paste("O. nubilalis", "\u2642"))) +
+  scale_fill_manual(values = c("#E69F00", "#56B4E9"),
+                    labels = c(paste("O. nubilalis", "\u2640"),
+                               paste("O. nubilalis", "\u2642"))) + ylim(c(0,50))
+
+p_dam_activity
+```
+
+Combine Photinus (iLAM), Ostrinia (iLAM), and Ostrinia (DAM) activity plots
+```{r}
+p_activity_combined = ggarrange(p_photinus_activity,
+                                p_be_activity,
+                                p_dam_activity,
+                                nrow = 3,
+                                labels = c("A", "B", "C")) 
+p_activity_combined
+
+
+#ggsave("activity_3x_combined.png",p_activity_combined, height=7, width = 7, units=c("in"))
+
+```
+
+
+Calculate peak activity phase and nocturnality for Ostrinia (DAM)
+```{r}
+#generate a datafarme to record information about peak activity phase and
+#ratio of nocturnal/diurnal activity
+diel_act_dam = data.frame(expand.grid(uid = dam_o[meta=T]$uid,
+                        day = 0:1),
+                        sex = dam_o[meta=T]$sex,
+                        phase = 0,
+                        activity_day = 0,
+                        activity_night = 0) %>% arrange(uid, day)
+
+#Set up butterworth filter, which we'll apply to each subset of binned data
+#order 2, 10 Hz low-pass filter t <- seq(0, 1, len = 96) # 1 second sample of time values
+bf <- butter(n = 2, W = 0.1, type = "low", plane = "z")
+
+#return parameters for each individual cage (uid)
+for (i in 1:nrow(diel_act_dam)){
+  
+  sub_dam_o = dam_o[xmv(uid) == diel_act_dam$uid[i]]
+  
+  #calculate phase of peak evening activity and day/night activity for each day of recording
+  
+  #now, isolate a specific day and calculate phase, total day activity, total night activity
+  small_dt_dam <- sub_dam_o[t>=hours(diel_act_dam$day[i]*24) & t<=hours(diel_act_dam$day[i]*24+24)]
+  small_dt_dam$t <- small_dt_dam$t/60/60-diel_act_dam$day[i]*24
+  
+  #for each uid, apply butterworth filter
+  small_dt_dam[, activity_butter := round(filtfilt(bf, activity_bin), 0)]
+  #return phase for each uid
+  small_df_dam <- as.data.frame(rejoin(small_dt_dam))
+  
+  # Returns a matrix where each row represents one peak found.
+  # The first column gives the height,
+  # second the position/index where the maximum is reached, 
+  # third and forth the indices of where the peak begins and ends,
+  # in the sense of where the pattern starts and ends.
+  
+  peak = pracma::findpeaks(small_df_dam$activity_butter,
+                   sortstr = TRUE,
+                   npeaks = 3,
+                   nups = 2)[1,2]
+  
+  if(is.null(peak)){
+    diel_act_dam$phase[i] <- small_df_dam$t[which.max(small_df_dam$activity_butter)]
+  } else{
+    diel_act_dam$phase[i] = small_df_dam$t[peak]
+  }
+  
+  
+  #calculate ratio night/day activity for each day
+  day <- sub_dam_o[t>=hours(diel_act_dam$day[i]*24) & t<=hours(diel_act_dam$day[i]*24+16)]
+  diel_act_dam$activity_day[i] = sum(day$activity, na.rm = TRUE) #to control for photophase length
+  night = sub_dam_o[t>=hours(diel_act_dam$day[i]*24+16) & t<=hours(diel_act_dam$day[i]*24+24)]
+  diel_act_dam$activity_night[i] = sum(night$activity, na.rm = TRUE) #to control for scotophase length
+  
+}
+
+diel_act_dam$perc_noct = diel_act_dam$activity_night/(diel_act_dam$activity_night+diel_act_dam$activity_day)*100
+diel_act_dam$phase = round(as.numeric(diel_act_dam$phase),2)
+diel_act_dam$perc_noct = round(as.numeric(diel_act_dam$perc_noct),2)
+
+diel_act_dam = diel_act_dam %>% group_by(uid, sex) %>%
+  summarise(phase = mean(phase),
+            activity_day = mean(activity_day),
+            activity_night = mean(activity_night),
+            perc_noct = mean(perc_noct)) %>% drop_na()
+
+#summarise mean for each sex
+sex_diel_act_dam = diel_act_dam %>% group_by(sex) %>% 
+  summarise(activity_phase = mean(phase, na.rm=TRUE),
+            n = n(),
+            ymin_phase = t.test(phase)$conf.int[1],
+            ymax_phase =  t.test(phase)$conf.int[2],
+            index_noct = mean(perc_noct, na.rm = TRUE),
+            ymin_noct = t.test(perc_noct)$conf.int[1],
+            ymax_noct = t.test(perc_noct)$conf.int[2])
+
+sex_diel_act_dam$ymax_noct[sex_diel_act_dam$ymax_noct>100] = 100
+sex_diel_act_dam$ymax_phase[sex_diel_act_dam$ymax_phase>24] = 24
+
+p_dam_phase = ggplot(data=diel_act_dam, aes(x=sex, y=phase, color=sex)) +
+  geom_point(size=3, alpha=0.5) +
+  geom_errorbar(data = sex_diel_act_dam,
+                aes(x=sex, ymin=ymin_phase,ymax=ymax_phase, color=sex),
+                 color = "black", inherit.aes = FALSE,
+                 size = 0.2, width=0.25) +
+    scale_color_manual(values = c("#E69F00", "#56B4E9"),
+                     labels = c("Female", "Male")) +
+  ylim(c(13,23)) + coord_flip() +
+  theme_bw() +
+  theme(text = element_text(size = 12, family = "sans", color = 'black'),
+        strip.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.y = element_blank()) +
+  ylab("Peak Activity (ZT)")
+
+p_dam_nd = ggplot(data=diel_act_dam, aes(x = sex, y=perc_noct, color=sex)) +
+  geom_point(size=3, alpha=0.5) +
+  geom_errorbar(data = sex_diel_act_dam,
+                aes(x=sex, ymin=ymin_noct,
+                    ymax=ymax_noct, color=sex),
+                color = "black", inherit.aes = FALSE,
+                size = 0.2, width=0.25) +
+ scale_color_manual(values = c("#E69F00", "#56B4E9"),
+                     labels = c("Female", "Male")) +
+  theme_bw() + ylim(c(0,100)) +
+  theme(text = element_text(size = 12, family = "sans", color = 'black'),
+        strip.background = element_blank(),
+        strip.text.x = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x = element_blank()) +
+  ylab("Nocturnality (%)")
+
+p_dam_all = ggarrange(p_dam_activity,                                               
+          ggarrange(p_dam_phase, p_dam_nd, ncol = 2, labels = c("B", "C")),
+          nrow = 2,
+          labels = "A") 
+p_dam_all
+#ggsave("analysis_dam_activity.png",p_dam_all, height=8, width = 16, units=c("in"))
+
+
+```
+
+Calculate peak activity phase and nocturnality for Ostrinia (iLAM)
+```{r}
+#generate a datafarme to record information about peak activity phase and
+#ratio of nocturnal/diurnal activity
+diel_act_be = data.frame(expand.grid(uid = iLAM_BE[meta=T]$uid,
+                        day = 0:2),
+                        sex = iLAM_BE[meta=T]$sex,
+                        phase = 0,
+                        activity_day = 0,
+                        activity_night = 0) %>% arrange(uid, day)
+
+#Set up butterworth filter, which we'll apply to each subset of binned data
+#order 2, 10 Hz low-pass filter t <- seq(0, 1, len = 96) # 1 second sample of time values
+bf <- butter(n = 2, W = 0.1, type = "low", plane = "z")
+
+#return parameters for each individual cage (uid)
+for (i in 1:nrow(diel_act_be)){
+  
+  sub_iLAM_be = iLAM_BE[xmv(uid) == diel_act_be$uid[i]]
+  
+  #calculate phase of peak evening activity and day/night activity for each day of recording
+  
+  #now, isolate a specific day and calculate phase, total day activity, total night activity
+  small_dt_be <- sub_iLAM_be[t>=hours(diel_act_be$day[i]*24) & t<=hours(diel_act_be$day[i]*24+24)]
+  small_dt_be$t <- small_dt_be$t/60/60-diel_act_be$day[i]*24
+  
+  #for each uid, apply butterworth filter
+  small_dt_be[, activity_butter := round(filtfilt(bf, activity_bin), 0)]
+  #return phase for each uid
+  small_df_be <- as.data.frame(rejoin(small_dt_be))
+  
+  # Returns a matrix where each row represents one peak found.
+  # The first column gives the height,
+  # second the position/index where the maximum is reached, 
+  # third and forth the indices of where the peak begins and ends,
+  # in the sense of where the pattern starts and ends.
+  
+   peak = findpeaks(small_df_be$activity_butter,
+                   sortstr = TRUE,
+                   npeaks = 5,
+                   nups = 2)[1,2]
+  
+  if(is.null(peak)){
+    diel_act_be$phase[i] <- NA
+  } else{
+    diel_act_be$phase[i] = small_df_be$t[peak]
+  }
+  
+  #calculate ratio night/day activity for each day
+  day <- sub_iLAM_be[t>=hours(diel_act_be$day[i]*24) & t<=hours(diel_act_be$day[i]*24+16)]
+  diel_act_be$activity_day[i] = sum(day$activity_bin, na.rm = TRUE) #to control for photophase length
+  night = sub_iLAM_be[t>=hours(diel_act_be$day[i]*24+16) & t<=hours(diel_act_be$day[i]*24+24)]
+  diel_act_be$activity_night[i] = sum(night$activity_bin, na.rm = TRUE) #to control for scotophase length
+  
+}
+
+diel_act_be$perc_noct = diel_act_be$activity_night/(diel_act_be$activity_night+diel_act_be$activity_day)*100
+diel_act_be$phase = round(as.numeric(diel_act_be$phase),2)
+diel_act_be$perc_noct = round(as.numeric(diel_act_be$perc_noct),2)
+
+#summarize mean for each uid!
+mean_diel_act_be = diel_act_be %>% group_by(sex, day) %>%
+  summarise(phase = mean(phase),
+            n = n(),
+            perc_noct = mean(perc_noct))
+#summarise mean for each sex
+sex_diel_act_be = mean_diel_act_be %>% group_by(sex) %>% 
+  summarise(activity_phase = mean(phase),
+            n = n(),
+            ymin_phase = t.test(phase)$conf.int[1],
+            ymax_phase =  t.test(phase)$conf.int[2],
+            index_noct = mean(perc_noct),
+            ymin_noct = t.test(perc_noct)$conf.int[1],
+            ymax_noct = t.test(perc_noct)$conf.int[2])
+
+sex_diel_act_be$ymax_noct[sex_diel_act_be$ymax_noct>100] = 100
+
+p_be_phase = ggplot(data=mean_diel_act_be, aes(x=sex, y=phase, color=sex)) +
+  geom_point(size=3, alpha=0.5) +
+  geom_errorbar(data = sex_diel_act_be,
+                aes(x=sex, ymin=ymin_phase,ymax=ymax_phase, color=sex),
+                 color = "black", inherit.aes = FALSE,
+                 size = 0.2, width=0.25) +
+    scale_color_manual(values = c("#E69F00", "#56B4E9"),
+                     labels = c("Female", "Male")) +
+  ylim(c(18,22.5)) + coord_flip() +
+  theme_bw() +
+  theme(text = element_text(size = 12, family = "sans", color = 'black'),
+        strip.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.y = element_blank()) +
+  ylab("Peak Activity (ZT)")
+
+p_be_nd = ggplot(data=mean_diel_act_be, aes(x = sex, y=perc_noct, color=sex)) +
+  geom_point(size=3, alpha=0.5) +
+  geom_errorbar(data = sex_diel_act_be,
+                aes(x=sex, ymin=ymin_noct,
+                    ymax=ymax_noct, color=sex),
+                color = "black", inherit.aes = FALSE,
+                size = 0.2, width=0.25) +
+ scale_color_manual(values = c("#E69F00", "#56B4E9"),
+                     labels = c("Female", "Male")) +
+  theme_bw() + ylim(c(0,100)) +
+  theme(text = element_text(size = 12, family = "sans", color = 'black'),
+        strip.background = element_blank(),
+        strip.text.x = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "none",
+        axis.title.x = element_blank()) +
+  ylab("Nocturnality (%)")
+
+p_be_all = ggarrange(p_be_activity,                                               
+          ggarrange(p_be_phase, p_be_nd, ncol = 2, labels = c("B", "C")),
+          nrow = 2,
+          labels = "A") 
+p_be_all
+ggsave("analysis_be_activity.png",p_be_all, height=8, width = 16, units=c("in"))
+
+
+mean_diel_act_be$species = "O. nubilalis"
+mean_diel_act_photinus$sex = "male"
+
+combined_results = rbind(mean_diel_act_be, mean_diel_act_photinus)
+combined_results$phase = round(combined_results$phase,2)
+write.csv(combined_results, "analysis_activity.csv")
+
+combined_results_mean = rbind((sex_diel_act_be %>% mutate("species" = "O. nubilalis")),
+                              (sex_diel_act_dam %>% mutate("species" = "O. nubilalis")),
+                              (species_diel_act_photinus[,1:8] %>% mutate("sex" = "male")))
+write.csv(combined_results_mean, "analysis_activity_mean.csv")
+
+
+
+```
+
+Calculate % rhythmic, rhythmic strength, and period length (tau) for bivoltine Ostrinia cages
+```{r}
+#Subset iLAM_BE to only retain counts recorded from days in DD
+small_dt_be <- iLAM_BE[t > hours(72)]
+
+#Calculate rhythmicity by chi_sq_periodogram method
+per_iLAM_BE <- periodogram(activity_bin,
+                           small_dt_be, FUN = chi_sq_periodogram,
+                           resample_rate = 1/mins(10),
+                           period_range=c(hours(18),hours(27)))
+
+per_iLAM_BE <-find_peaks(per_iLAM_BE)
+
+ggperio(per_iLAM_BE, aes(period, power, colour=sex)) + 
+  stat_pop_etho() +
+  geom_line(aes(y = signif_threshold), color="black", linetype = "longdash") + 
+  theme_bw() + theme(text = element_text(size = 18, family = "sans", color = 'black'),
+                     panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(),
+                     legend.position = c(0.2,0.8)) +
+  ylab("Power") + xlab("Period Length (hr)")
+
+
+#Rhythmicity for populations are determined by Power-Significance
+#If (P-S)<0, then rhythmicity<-0
+
+# Create a data table with all_ids and missing values for the columns
+summary_dt_BE <- per_iLAM_BE[meta=T]
+# Get the summary data for ids that have a peak==1
+summary_dt_BE_peak <- per_iLAM_BE[peak == 1,
+                                  .(first_peak_period = period,
+                                    first_peak_rel_power = power - signif_threshold,
+                                    is_rhythmic = TRUE), 
+                                  by = id]
+# Left join summary_dt_BE_peak with summary_dt_BE
+summary_dt_BE <- summary_dt_BE_peak[summary_dt_BE, on = "id"]
+
+# Replace NA values in is_rhythmic with FALSE
+summary_dt_BE[is.na(is_rhythmic), is_rhythmic := FALSE]
+summary_dt_BE[, period := round(first_peak_period/60/60,2) ]
+
+output_be = as.data.frame(summary_dt_BE)
+ggplot(output_be, aes(sex, period, fill= sex)) + 
+  geom_point(aes(size=first_peak_rel_power), alpha=1) +
+  ylim(c(19,23.5)) + theme_bw()
+
+
+```
+
+Calculate % rhythmic, rhythmic strength, and period length (tau) for univoltine Ostrinia cages
+```{r}
+iLAM_UZ = iLAM_onub[xmv(strain) == "uz"]
+
+#add uid for specific identification for each cage/experiment/species
+iLAM_UZ[, uid := 1:.N, meta=T]
+
+library(zoo)
+iLAM_UZ[, activity_bin := rollapply(activity, list(seq(0, 14)),
+                                          FUN=function(x) sum(x, na.rm=TRUE),
+                                          partial = TRUE, fill = NA),
+              by = xmv(uid)]
+
+#For each uid, retains only the 15th row (t) = 30min bins, 5 = 10min bins
+iLAM_UZ = iLAM_UZ[, .SD[seq(1, .N, 15)], by = id]
+
+#Calculate average activity across all bins to normalize activity_bins between cages
+iLAM_UZ[, uid := 1:.N, meta=T]
+iLAM_UZ[, fctr := .(10/mean(activity_bin)), by = xmv(uid)]
+iLAM_UZ[, .N, by=xmv(uid)] #verify that proper number of bins were kept
+
+small_dt <- iLAM_UZ[t <=hours(120)] #retain first 5 days in dd
+
+#Average double-plotted actograms for each group across the experiment
+ggetho(iLAM_UZ, aes(x=t, z=activity_bin), multiplot = 2) + 
+  stat_bar_tile_etho() +
+  facet_wrap( ~ sex) + 
+  theme_bw() + theme(text = element_text(size = 18, family = "sans", color = 'black'),
+                     panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(),
+                     legend.position = c(0.8,0.8))
+
+#Calculate rhythmicity by chi_sq_periodogram method
+per_iLAM_UZ <- periodogram(activity_bin,
+                           iLAM_UZ, FUN = chi_sq_periodogram,
+                           resample_rate = 1/mins(10),
+                           period_range=c(hours(18),hours(27)))
+
+per_iLAM_UZ <-find_peaks(per_iLAM_UZ)
+
+ggperio(per_iLAM_UZ, aes(period, power, colour=sex)) + 
+  stat_pop_etho() +
+  geom_line(aes(y = signif_threshold), color="black", linetype = "longdash") + 
+  theme_bw() + theme(text = element_text(size = 18, family = "sans", color = 'black'),
+                     panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(),
+                     legend.position = c(0.2,0.8)) +
+  ylab("Power") + xlab("Period Length (hr)")
+
+
+# Create a data table with all_ids and missing values for the columns
+summary_dt_UZ <- per_iLAM_UZ[meta=T]
+# Get the summary data for ids that have a peak==1
+summary_dt_UZ_peak <- per_iLAM_UZ[peak == 1,
+                                  .(first_peak_period = period,
+                                    first_peak_rel_power = power - signif_threshold,
+                                    is_rhythmic = TRUE), 
+                                  by = id]
+# Left join summary_dt_UZ_peak with summary_dt_UZ
+summary_dt_UZ <- summary_dt_UZ_peak[summary_dt_UZ, on = "id"]
+
+# Replace NA values in is_rhythmic with FALSE
+summary_dt_UZ[is.na(is_rhythmic), is_rhythmic := FALSE]
+summary_dt_UZ[, period := round(first_peak_period/60/60,2) ]
+
+output_uz = as.data.frame(summary_dt_UZ)
+ggplot(output_uz, aes(sex, period, fill= sex)) + 
+  geom_point(aes(size=first_peak_rel_power), alpha=1) +
+  ylim(c(19,23.5)) + theme_bw()
+
+output_onub = rbind(output_be,output_uz) %>%
+  select(-c(experiment_id, start_datetime, stop_datetime, swap_datetime, file_info, id, uid))
+output_onub = data.frame(output_onub)
+output_onub$sex = as.factor(output_onub$sex)
+output_onub$strain = as.factor(output_onub$strain)
+
+output_onub %>% ungroup() %>%
+  group_by(sex, strain) %>%
+  summarize(n_cage = n(),
+            percent_rhythmic = round(length(period[!is.na(period)])/n_cage*100, 0),
+            tau = mean(period, na.rm = TRUE),
+            ymin_tau = ifelse(sum(!is.na(period)) >= 3, t.test(period)$conf.int[1], NA),
+            ymax_tau = ifelse(sum(!is.na(period)) >= 3, t.test(period)$conf.int[2], NA),
+            rhythmic_strength = round(mean(first_peak_rel_power, na.rm=TRUE),0),
+            ymin_strength = ifelse(sum(!is.na(first_peak_rel_power)) >= 3,
+                                   t.test(first_peak_rel_power)$conf.int[1], NA),
+            ymax_strength = ifelse(sum(!is.na(first_peak_rel_power)) >= 3,
+                                   t.test(first_peak_rel_power)$conf.int[2], NA))
+
+output_onub$first_peak_rel_power = round(output_onub$first_peak_rel_power,0)
+
+write.csv(output_onub, "analysis_circ.csv")
+
+```
+
+

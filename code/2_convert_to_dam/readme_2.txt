@@ -1,0 +1,1 @@
+representative script to convert iLAM movements (input subdirectory) into usable DAM format to read into Rethomics framework (output subdirectory)
